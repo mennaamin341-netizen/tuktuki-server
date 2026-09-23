@@ -216,14 +216,15 @@ async def tts_batch(body: dict, request: Request, x_api_key: str = Header(defaul
         pics.append({"asset": {"type": "image", "src": images[i]}, "start": t, "length": length,
                      "effect": effects[i % 4], "fit": "cover", "transition": {"in": "fade"}})
         sounds.append({"asset": {"type": "audio", "src": public_url(name, request), "volume": 1}, "start": t, "length": length})
-        subs.append(html_clip(s["text"], css_sub, t, length, 1200, 160, "bottom"))
+        if body.get("subtitles", False):
+            subs.append(html_clip(s["text"], css_sub, t, length, 1200, 160, "bottom"))
         t = round(t + length, 2)
     pics.append({"asset": {"type": "image", "src": images[-1]}, "start": t, "length": OUTRO, "effect": "zoomOut", "fit": "cover"})
     titles.append(html_clip(body.get("outro_text", "باي باي! نشوفكم بكرة!"), css_title.replace("110px", "80px"), t, OUTRO, 1280, 300, "center"))
     total = round(t + OUTRO, 2)
 
     timeline = {"fonts": [{"src": font_url}], "background": "#B3E5FC",
-                "tracks": [{"clips": subs}, {"clips": titles}, {"clips": pics}, {"clips": sounds}]}
+                "tracks": ([{"clips": subs}] if subs else []) + [{"clips": titles}, {"clips": pics}, {"clips": sounds}]}
     music = body.get("music_url") or (public_url_static("music.mp3", request) if (STATIC / "music.mp3").exists() else "")
     if music:
         timeline["soundtrack"] = {"src": music, "effect": "fadeOut", "volume": 0.1}
