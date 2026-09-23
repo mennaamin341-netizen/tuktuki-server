@@ -96,6 +96,8 @@ async def cf_image(client, prompt, seed, path):
                     path.write_bytes(base64.b64decode(img))
                     return True
             print("cloudflare image error:", r.status_code, r.text[:300])
+            if 400 <= r.status_code < 500 and r.status_code != 429:
+                return False   # bad request / auth: retrying won't help
         except Exception as e:
             print("cloudflare image exception:", e)
         await asyncio.sleep(5 * (attempt + 1))
