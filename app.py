@@ -19,6 +19,7 @@ CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")      # Cloudflare Workers AI (fre
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 POLLINATIONS_TOKEN = os.getenv("POLLINATIONS_TOKEN", "")  # optional fallback
 PUBLIC_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME") or os.getenv("SPACE_HOST") or ""  # set automatically by Render
+IMAGE_DEADLINE = int(os.getenv("IMAGE_DEADLINE", "150"))  # seconds; keeps the whole request under Make's 300s timeout
 FILES = Path("/tmp/files"); FILES.mkdir(parents=True, exist_ok=True)
 STATIC = Path(__file__).parent / "static"; STATIC.mkdir(exist_ok=True)
 
@@ -76,7 +77,7 @@ def cleanup(max_age_hours=48):
 async def synth(text, voice, rate, pitch, path):
     for attempt in range(3):
         try:
-            await edge_tts.Communicate(text, voice, rate=norm_rate(rate), pitch=norm_pitch(pitch, voice)).save(str(path))
+            await asyncio.wait_for(edge_tts.Communicate(text, voice, rate=norm_rate(rate), pitch=norm_pitch(pitch, voice)).save(str(path)), timeout=30)
             return MP3(str(path)).info.length
         except Exception:
             if attempt == 2:
@@ -86,10 +87,10 @@ async def synth(text, voice, rate, pitch, path):
 async def cf_image(client, prompt, seed, path):
     """Cloudflare Workers AI - FLUX.1 schnell (free daily quota)."""
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
-    for attempt in range(5):
+    for attempt in range(3):
         try:
             r = await client.post(url, headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
-                                  json={"prompt": prompt[:2000], "steps": 8}, timeout=120)
+                                  json={"prompt": prompt[:2000], "steps": 4}, timeout=60)
             if r.status_code == 200:
                 img = (r.json().get("result") or {}).get("image")
                 if img:
@@ -100,14 +101,14 @@ async def cf_image(client, prompt, seed, path):
                 return False   # bad request / auth: retrying won't help
         except Exception as e:
             print("cloudflare image exception:", e)
-        await asyncio.sleep(5 * (attempt + 1))
+        await asyncio.sleep(3)
     return False
 
 async def fetch_image(client, url, path):
     headers = {"Authorization": f"Bearer {POLLINATIONS_TOKEN}"} if POLLINATIONS_TOKEN else {}
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            r = await client.get(url, headers=headers, timeout=120)
+            r = await client.get(url, headers=headers, timeout=40)
             if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
                 path.write_bytes(r.content)
                 return True
@@ -169,7 +170,9 @@ async def tts_batch(body: dict, request: Request, x_api_key: str = Header(defaul
         async with sem:
             d = await synth(s["text"], v.get("voice", FEMALE), v.get("rate"), v.get("pitch"), p)
         return p.name, d
+    t_audio = time.time()
     audio = await asyncio.gather(*[do_audio(i, s) for i, s in enumerate(scenes)])
+    print(f"audio: {len(audio)} lines in {time.time()-t_audio:.0f}s")
 
     # 2) images (download from Pollinations so Shotstack never times out)
     async def do_image(client, i, s):
@@ -184,11 +187,17 @@ async def tts_batch(body: dict, request: Request, x_api_key: str = Header(defaul
             ok = await fetch_image(client, url, p)
         return public_url(p.name, request) if ok else None
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        img_sem = asyncio.Semaphore(2)
+        img_sem = asyncio.Semaphore(3)
         async def limited(i, s):
             async with img_sem:
                 return await do_image(client, i, s)
-        images = await asyncio.gather(*[limited(i, s) for i, s in enumerate(scenes)])
+        t0 = time.time()
+        tasks = [asyncio.create_task(limited(i, s)) for i, s in enumerate(scenes)]
+        done, pending = await asyncio.wait(tasks, timeout=IMAGE_DEADLINE)
+        for tk in pending:
+            tk.cancel()
+        images = [tk.result() if (tk in done and not tk.exception()) else None for tk in tasks]
+        print(f"images: {sum(1 for x in images if x)}/{len(images)} ok in {time.time()-t0:.0f}s")
 
     # fill failed scenes with the nearest successful image, so the render never breaks
     good = [u for u in images if u]
