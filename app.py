@@ -86,10 +86,10 @@ async def synth(text, voice, rate, pitch, path):
 async def cf_image(client, prompt, seed, path):
     """Cloudflare Workers AI - FLUX.1 schnell (free daily quota)."""
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             r = await client.post(url, headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
-                                  json={"prompt": prompt[:2000], "steps": 8, "seed": seed}, timeout=120)
+                                  json={"prompt": prompt[:2000], "steps": 8}, timeout=120)
             if r.status_code == 200:
                 img = (r.json().get("result") or {}).get("image")
                 if img:
@@ -98,7 +98,7 @@ async def cf_image(client, prompt, seed, path):
             print("cloudflare image error:", r.status_code, r.text[:300])
         except Exception as e:
             print("cloudflare image exception:", e)
-        await asyncio.sleep(3)
+        await asyncio.sleep(5 * (attempt + 1))
     return False
 
 async def fetch_image(client, url, path):
@@ -180,13 +180,23 @@ async def tts_batch(body: dict, request: Request, x_api_key: str = Header(defaul
             ok = await cf_image(client, prompt + ", wide shot, centered composition", seed + i, p)
         if not ok:
             ok = await fetch_image(client, url, p)
-        return public_url(p.name, request) if ok else url
+        return public_url(p.name, request) if ok else None
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        img_sem = asyncio.Semaphore(3)
+        img_sem = asyncio.Semaphore(2)
         async def limited(i, s):
             async with img_sem:
                 return await do_image(client, i, s)
         images = await asyncio.gather(*[limited(i, s) for i, s in enumerate(scenes)])
+
+    # fill failed scenes with the nearest successful image, so the render never breaks
+    good = [u for u in images if u]
+    if not good:
+        raise HTTPException(502, "all image generations failed (check CF_ACCOUNT_ID / CF_API_TOKEN and Cloudflare quota)")
+    for i in range(len(images)):
+        if not images[i]:
+            prev = next((images[j] for j in range(i - 1, -1, -1) if images[j]), None)
+            images[i] = prev or good[0]
+            print(f"scene {i}: image failed, reused another scene image")
 
     # 3) Shotstack timeline
     font_url = public_url_static("Lalezar.ttf", request)
