@@ -19,6 +19,7 @@ CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")      # Cloudflare Workers AI (fre
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 POLLINATIONS_TOKEN = os.getenv("POLLINATIONS_TOKEN", "")  # optional fallback
 PUBLIC_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME") or os.getenv("SPACE_HOST") or ""  # set automatically by Render
+MIN_IMAGE_RATIO = float(os.getenv("MIN_IMAGE_RATIO", "0.7"))  # stop the episode if fewer images succeed
 IMAGE_DEADLINE = int(os.getenv("IMAGE_DEADLINE", "150"))  # seconds; keeps the whole request under Make's 300s timeout
 FILES = Path("/tmp/files"); FILES.mkdir(parents=True, exist_ok=True)
 STATIC = Path(__file__).parent / "static"; STATIC.mkdir(exist_ok=True)
@@ -118,11 +119,11 @@ async def fetch_image(client, url, path):
     return False
 
 # ---------- endpoints ----------
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok", "voices": list(DEFAULT_VOICES)}
 
-@app.get("/files/{name}")
+@app.api_route("/files/{name}", methods=["GET", "HEAD"])
 def files(name: str):
     p = FILES / Path(name).name
     if not p.exists():
@@ -201,8 +202,9 @@ async def tts_batch(body: dict, request: Request, x_api_key: str = Header(defaul
 
     # fill failed scenes with the nearest successful image, so the render never breaks
     good = [u for u in images if u]
-    if not good:
-        raise HTTPException(502, "all image generations failed (check CF_ACCOUNT_ID / CF_API_TOKEN and Cloudflare quota)")
+    min_ok = max(1, int(len(images) * MIN_IMAGE_RATIO))
+    if len(good) < min_ok:
+        raise HTTPException(502, f"only {len(good)}/{len(images)} images generated - episode stopped so a bad video is not published (check Cloudflare quota / token)")
     for i in range(len(images)):
         if not images[i]:
             prev = next((images[j] for j in range(i - 1, -1, -1) if images[j]), None)
@@ -216,16 +218,21 @@ async def tts_batch(body: dict, request: Request, x_api_key: str = Header(defaul
     css_title = ("p{font-family:'Lalezar';font-size:110px;color:#FFEB3B;text-align:center;direction:rtl;"
                  "text-shadow:5px 5px 0 #3E2723,-5px -5px 0 #3E2723,5px -5px 0 #3E2723,-5px 5px 0 #3E2723;}")
     effects = ["zoomInSlow", "slideLeftSlow", "zoomOutSlow", "slideRightSlow"]
-    INTRO, OUTRO = 3.0, 4.0
+    INTRO = 3.0 if body.get("intro", False) else 0.0   # no intro by default: start straight away
+    OUTRO = 4.0
     subs, pics, sounds, titles = [], [], [], []
     t = INTRO
-    titles.append(html_clip(body.get("series_title", "توكتوكي"), css_title, 0, INTRO, 1280, 300, "center"))
-    pics.append({"asset": {"type": "image", "src": images[0]}, "start": 0, "length": INTRO, "effect": "zoomIn", "fit": "cover"})
+    if INTRO:
+        titles.append(html_clip(body.get("series_title", "توكتوكي"), css_title, 0, INTRO, 1280, 300, "center"))
+        pics.append({"asset": {"type": "image", "src": images[0]}, "start": 0, "length": INTRO, "effect": "zoomIn", "fit": "cover"})
     for i, s in enumerate(scenes):
         name, dur = audio[i]
         length = round(dur + 0.4, 2)
-        pics.append({"asset": {"type": "image", "src": images[i]}, "start": t, "length": length,
-                     "effect": effects[i % 4], "fit": "cover", "transition": {"in": "fade"}})
+        clip = {"asset": {"type": "image", "src": images[i]}, "start": t, "length": length,
+                "effect": effects[i % 4], "fit": "cover"}
+        if i > 0 or INTRO:
+            clip["transition"] = {"in": "fade"}
+        pics.append(clip)
         sounds.append({"asset": {"type": "audio", "src": public_url(name, request), "volume": 1}, "start": t, "length": length})
         if body.get("subtitles", False):
             subs.append(html_clip(s["text"], css_sub, t, length, 1200, 160, "bottom"))
